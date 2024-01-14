@@ -40,7 +40,7 @@ pub fn ibc_packet_ack(
 #[allow(clippy::pedantic)]
 pub fn ibc_packet_timeout(
     deps: DepsMut,
-    _env: Env,
+    env: Env,
     msg: IbcPacketTimeoutMsg,
 ) -> Result<IbcBasicResponse, ContractError> {
     // Due to the semantics of ordered channels, the underlying channel end is closed.
@@ -52,7 +52,17 @@ pub fn ibc_packet_timeout(
         },
     )?;
 
-    ibc_packet_timeout::callback(deps, msg.packet, msg.relayer)
+    let mut resp = IbcBasicResponse::default();
+
+    if let Some(reopen_msg) = ibc_packet_timeout::reopen_channel(deps.storage, &env)? {
+        resp = resp.add_message(reopen_msg);
+    }
+
+    if let Some(callback_msg) = ibc_packet_timeout::callback(deps.storage, msg.packet, msg.relayer)? {
+        resp = resp.add_message(callback_msg);
+    }
+
+    Ok(resp)
 }
 
 /// Handles the `PacketReceive` for the IBC module.
@@ -148,37 +158,53 @@ mod ibc_packet_ack {
 }
 
 mod ibc_packet_timeout {
-    use cosmwasm_std::{Addr, IbcPacket};
+    use cosmwasm_std::{Addr, IbcPacket, Storage, CosmosMsg, Env};
 
-    use crate::types::{callbacks::IcaControllerCallbackMsg, state::STATE};
+    use crate::{types::{callbacks::IcaControllerCallbackMsg, state::{STATE, CHANNEL_OPEN_INIT_OPTIONS}}, ibc::types::stargate::channel::new_ica_channel_open_init_cosmos_msg};
 
-    use super::{ContractError, DepsMut, IbcBasicResponse, CALLBACK_COUNTER};
+    use super::{ContractError, CALLBACK_COUNTER};
 
-    /// Handles the timeout callbacks.
-    #[allow(clippy::needless_pass_by_value)]
+    /// Increments the callback counter and provides the callback message to the
+    /// external contract if one is registered.
     pub fn callback(
-        deps: DepsMut,
+        storage: &mut dyn Storage,
         packet: IbcPacket,
         relayer: Addr,
-    ) -> Result<IbcBasicResponse, ContractError> {
-        let state = STATE.load(deps.storage)?;
+    ) -> Result<Option<CosmosMsg>, ContractError> {
+        let state = STATE.load(storage)?;
 
         // Increment the callback counter.
-        CALLBACK_COUNTER.update(deps.storage, |mut cc| -> Result<_, ContractError> {
+        CALLBACK_COUNTER.update(storage, |mut cc| -> Result<_, ContractError> {
             cc.timeout();
             Ok(cc)
         })?;
 
-        if let Some(contract_addr) = state.callback_address {
+        state.callback_address.map_or(Ok(None), |contract_addr| {
             let callback_msg = IcaControllerCallbackMsg::OnTimeoutPacketCallback {
                 original_packet: packet,
                 relayer,
             }
             .into_cosmos_msg(contract_addr)?;
 
-            Ok(IbcBasicResponse::default().add_message(callback_msg))
-        } else {
-            Ok(IbcBasicResponse::default())
-        }
+            Ok(Some(callback_msg))
+        })
+    }
+
+    /// Provides the channel reopen message if the [`CHANNEL_OPEN_INIT_OPTIONS`] are set.
+    pub fn reopen_channel(
+        storage: &dyn Storage,
+        env: &Env,
+    ) -> Result<Option<CosmosMsg>, ContractError> {
+        CHANNEL_OPEN_INIT_OPTIONS.may_load(storage)?.map_or(Ok(None), |options| {
+            let ica_channel_open_init_msg = new_ica_channel_open_init_cosmos_msg(
+                env.contract.address.to_string(),
+                options.connection_id,
+                options.counterparty_port_id,
+                options.counterparty_connection_id,
+                options.tx_encoding,
+            );
+
+            Ok(Some(ica_channel_open_init_msg))
+        })
     }
 }
