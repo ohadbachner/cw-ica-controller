@@ -192,10 +192,15 @@ mod ibc_packet_timeout {
 
     /// Provides the channel reopen message if the [`CHANNEL_OPEN_INIT_OPTIONS`] are set.
     pub fn reopen_channel(
-        storage: &dyn Storage,
+        storage: &mut dyn Storage,
         env: &Env,
     ) -> Result<Option<CosmosMsg>, ContractError> {
-        CHANNEL_OPEN_INIT_OPTIONS.may_load(storage)?.map_or(Ok(None), |options| {
+        if let Some(options) = CHANNEL_OPEN_INIT_OPTIONS.may_load(storage)? {
+            STATE.update(storage, |mut state| -> Result<_, ContractError> {
+                state.enable_channel_open_init();
+                Ok(state)
+            })?;
+
             let ica_channel_open_init_msg = new_ica_channel_open_init_cosmos_msg(
                 env.contract.address.to_string(),
                 options.connection_id,
@@ -205,6 +210,8 @@ mod ibc_packet_timeout {
             );
 
             Ok(Some(ica_channel_open_init_msg))
-        })
+        } else {
+            Ok(None)
+        }
     }
 }
